@@ -327,6 +327,51 @@ def test_purge_during_fill_keeps_old_download_alive(proxy, origin):
         set_behavior(origin.url)
 
 
+def test_purge_during_read_of_complete_package_refetches_for_new_download(proxy, origin):
+    """A complete package with an active reader must not be adoptable from
+    disk by a new request after purge; that request has to go to the origin."""
+    set_behavior(origin.url, delay_ms=20, chunk_size=64 * 1024)
+    try:
+        origin_reset(origin.url)
+        with client() as c:
+            new = c.post(f"{origin.url}/control/content/{PKG_BIG}").json()
+        download_bytes(proxy.url, PKG_BIG)  # cache it
+        assert origin_stats(origin.url)["paths"][PKG_BIG] == 1
+
+        result: dict = {}
+
+        def slow_reader():
+            with client(timeout_read=300).stream(
+                "GET", f"{proxy.url}/packages/{PKG_BIG}"
+            ) as r:
+                got = 0
+                for chunk in r.iter_bytes(64 * 1024):
+                    got += len(chunk)
+                    time.sleep(0.2)
+                    if got >= 4 * 64 * 1024:
+                        break
+                result["got"] = got
+
+        t = threading.Thread(target=slow_reader)
+        t.start()
+        time.sleep(0.5)
+        with client() as c:
+            assert c.post(f"{proxy.url}/purge/{PKG_BIG}").status_code == 200
+
+        with client() as c:
+            r = c.get(f"{proxy.url}/packages/{PKG_BIG}")
+        t.join(60)
+
+        assert r.headers["x-cache"] == "MISS"
+        assert sha256(r.content) == new["sha256"]
+        assert origin_stats(origin.url)["paths"][PKG_BIG] == 2
+        assert result["got"] > 0
+    finally:
+        set_behavior(origin.url)
+        with client() as c:
+            c.post(f"{proxy.url}/purge/{PKG_BIG}")
+
+
 def test_upstream_disconnect_fails_all_and_caches_nothing(proxy, origin):
     set_behavior(origin.url, delay_ms=50, chunk_size=64 * 1024, truncate=200_000)
     try:

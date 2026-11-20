@@ -31,7 +31,7 @@ behavior = {
     "truncate_after_bytes": None,  # int | None
     "chunk_size": 256 * 1024,
 }
-hits = {"total": 0, "paths": {}}
+hits = {"total": 0, "paths": {}, "active": 0, "max_active": 0}
 digests: dict[str, str] = {}
 
 
@@ -118,23 +118,28 @@ async def get_package(path: str):
         chunk_size = max(1, int(beh["chunk_size"]))
         delay = max(0, int(beh["chunk_delay_ms"])) / 1000.0
         trunc = beh["truncate_after_bytes"]
-        with open(p, "rb") as f:
-            while True:
-                if delay:
-                    await asyncio.sleep(delay)
-                chunk = await asyncio.to_thread(f.read, chunk_size)
-                if not chunk:
-                    break
-                if trunc is not None and sent + len(chunk) > trunc:
-                    remain = max(0, int(trunc) - sent)
-                    if remain:
-                        sent += remain
-                        yield chunk[:remain]
-                    # Simulate upstream abort: die mid-body after a partial
-                    # response so the client sees a truncated payload.
-                    raise UpstreamAbort("simulated upstream abort")
-                sent += len(chunk)
-                yield chunk
+        hits["active"] += 1
+        hits["max_active"] = max(hits["max_active"], hits["active"])
+        try:
+            with open(p, "rb") as f:
+                while True:
+                    if delay:
+                        await asyncio.sleep(delay)
+                    chunk = await asyncio.to_thread(f.read, chunk_size)
+                    if not chunk:
+                        break
+                    if trunc is not None and sent + len(chunk) > trunc:
+                        remain = max(0, int(trunc) - sent)
+                        if remain:
+                            sent += remain
+                            yield chunk[:remain]
+                        # Simulate upstream abort: die mid-body after a partial
+                        # response so the client sees a truncated payload.
+                        raise UpstreamAbort("simulated upstream abort")
+                    sent += len(chunk)
+                    yield chunk
+        finally:
+            hits["active"] -= 1
 
     headers = {"Content-Length": str(size)}
     sha = digests.get(key)
@@ -191,6 +196,8 @@ async def stats():
     return {
         "total_hits": hits["total"],
         "paths": dict(hits["paths"]),
+        "active": hits["active"],
+        "max_active": hits["max_active"],
         "packages": packages,
         "behavior": dict(behavior),
     }
@@ -200,4 +207,5 @@ async def stats():
 async def reset():
     hits["total"] = 0
     hits["paths"] = {}
+    hits["max_active"] = hits["active"]
     return {"ok": True}

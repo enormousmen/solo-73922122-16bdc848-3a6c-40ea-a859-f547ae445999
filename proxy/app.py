@@ -16,6 +16,14 @@ Design notes
 * Origin failure fails every attached download and never leaves a cached
   half-package. Startup deletes leftover ``.part-*`` files and keeps complete
   packages.
+* Prewarm (POST /cache/prewarm) walks a batch sequentially. Only fills that
+  prewarm itself starts consume the global prewarm origin slot (at most one
+  such fetch unfinished at a time); normal downloads never wait for it.
+  A prewarm item adopts whatever fill/complete generation already exists for
+  its path, so a download that raced ahead shares its origin fetch. A purge
+  marks every unfinished prewarm item for its path as purged: queued items
+  never start a fetch, adopted/in-flight fills keep feeding already-attached
+  readers but are never re-registered, and the purged item reports "purged".
 """
 
 from __future__ import annotations
@@ -32,6 +40,7 @@ from pathlib import Path
 import aiohttp
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse, StreamingResponse
+from pydantic import BaseModel, Field
 
 ORIGIN_BASE_URL = os.environ.get("ORIGIN_BASE_URL", "http://127.0.0.1:9000").rstrip("/")
 CACHE_DIR = Path(os.environ.get("CACHE_DIR", "./cache")).resolve()
@@ -87,6 +96,7 @@ class Entry:
         self.meta: dict = {}
         self.cond = asyncio.Condition()
         self.fill_task: asyncio.Task | None = None
+        self.prewarm_slot = False  # this fill holds the prewarm origin slot
 
     @property
     def final_path(self) -> Path:
@@ -109,7 +119,24 @@ class Entry:
             "size": self.size,
             "gen": self.gen,
             "error": self.error,
+            "prewarm_fill": self.prewarm_slot,
         }
+
+
+class PrewarmItem:
+    """One path inside a prewarm batch, from submission until it is reported.
+
+    ``purged`` is set by a purge of the same path while this item is still
+    unfinished: the item then reports ``purged`` and never starts a fetch.
+    """
+
+    def __init__(self, key: str, seq: int) -> None:
+        self.key = key
+        self.seq = seq
+        self.purged = False
+
+    def mark_purged(self) -> None:
+        self.purged = True
 
 
 class Cache:
@@ -117,6 +144,13 @@ class Cache:
         self.entries: dict[str, Entry] = {}
         self.lock = asyncio.Lock()
         self.session: aiohttp.ClientSession | None = None
+        # Serialises prewarm scheduling; shares self.lock so choosing a fill
+        # and registering it is atomic with respect to downloads and purges.
+        self.prewarm_cond = asyncio.Condition(self.lock)
+        # At most one origin fill started by prewarm may be unfinished.
+        self.prewarm_busy = False
+        # Unfinished prewarm items, keyed by path, so purge can report them.
+        self.prewarm_waiters: dict[str, set[PrewarmItem]] = {}
 
     # ------------------------------------------------------------------ #
     # registry                                                            #
@@ -154,6 +188,8 @@ class Cache:
                 e = Entry(key)
                 self.entries[key] = e
                 e.fill_task = asyncio.create_task(self._fill(e))
+                # Queued prewarm items for this path adopt this fill.
+                self.prewarm_cond.notify_all()
             e.readers += 1
             return e
 
@@ -163,27 +199,54 @@ class Cache:
             self._maybe_reap_locked(e)
 
     async def purge(self, key: str) -> bool:
-        """Unregister the current generation; files go away with last reader."""
+        """Unregister the current generation; files go away with last reader.
+
+        Every unfinished prewarm item for this path is marked purged before
+        returning: queued items will never start an origin fetch, and running
+        items report ``purged`` instead of ``ready``.
+        """
         async with self.lock:
+            waiters = self.prewarm_waiters.pop(key, None)
+            if waiters:
+                for item in waiters:
+                    item.mark_purged()
             e = self.entries.pop(key, None)
             if e is not None:
                 e.purged = True
+                if e.state == "complete" and e.readers > 0:
+                    # Keep serving the readers that already attached, but make
+                    # sure a new request cannot adopt this file from disk
+                    # while it lingers: hide it under its part name.
+                    try:
+                        os.replace(e.final_path, e.part_path)
+                    except OSError:
+                        pass
                 self._maybe_reap_locked(e)
-                return True
-            # Not in memory (e.g. never requested since restart): clean disk.
-            existed = False
-            final = CACHE_DIR / key
-            for p in (final, CACHE_DIR / f"{key}.meta"):
-                if p.exists():
-                    _unlink_quiet(p)
-                    existed = True
-            try:
-                for p in final.parent.glob(final.name + ".part-*"):
-                    _unlink_quiet(p)
-                    existed = True
-            except OSError:
-                pass
-            return existed
+                # Wake prewarm items waiting on this generation so they can
+                # report "purged" at once; the fill itself keeps running for
+                # downloads that already attached.
+                async with e.cond:
+                    e.cond.notify_all()
+                existed = True
+            else:
+                # Not in memory (e.g. never requested since restart): clean disk.
+                existed = False
+                final = CACHE_DIR / key
+                for p in (final, CACHE_DIR / f"{key}.meta"):
+                    if p.exists():
+                        _unlink_quiet(p)
+                        existed = True
+                try:
+                    for p in final.parent.glob(final.name + ".part-*"):
+                        _unlink_quiet(p)
+                        existed = True
+                except OSError:
+                    pass
+            if waiters:
+                # Re-check queued items: a purged item must not wait for the
+                # origin slot to free up before it can be reported.
+                self.prewarm_cond.notify_all()
+        return existed
 
     def _maybe_reap_locked(self, e: Entry) -> None:
         """Delete files once no readers remain and the fill is over."""
@@ -253,6 +316,7 @@ class Cache:
                     except OSError:
                         pass
                     e.state = "complete"
+                self._release_prewarm_slot_locked(e)
                 async with e.cond:
                     e.cond.notify_all()
                 self._maybe_reap_locked(e)
@@ -265,11 +329,124 @@ class Cache:
     async def _finish(self, e: Entry, state: str) -> None:
         async with self.lock:
             e.state = state
+            self._release_prewarm_slot_locked(e)
             if state == "failed" and self.entries.get(e.key) is e:
                 del self.entries[e.key]  # next GET retries the origin
             async with e.cond:
                 e.cond.notify_all()
             self._maybe_reap_locked(e)
+
+    def _release_prewarm_slot_locked(self, e: Entry) -> None:
+        """A prewarm-started fill is over: let the next item start one."""
+        if not e.prewarm_slot:
+            return
+        e.prewarm_slot = False
+        self.prewarm_busy = False
+        self.prewarm_cond.notify_all()
+
+    # ------------------------------------------------------------------ #
+    # prewarm                                                             #
+    # ------------------------------------------------------------------ #
+
+    async def register_prewarm(self, keys: list[str]) -> list[PrewarmItem]:
+        """Register a batch before any item starts, so a purge that arrives
+        while an item is still queued can mark it as purged."""
+        items = [PrewarmItem(key, seq) for seq, key in enumerate(keys)]
+        async with self.lock:
+            for item in items:
+                self.prewarm_waiters.setdefault(item.key, set()).add(item)
+        return items
+
+    def unregister_prewarm(self, items: list[PrewarmItem]) -> None:
+        """Drop items that will never be processed (e.g. client disconnect).
+
+        Deliberately synchronous: it runs in a response generator's ``finally``
+        while the request is being cancelled, where awaiting is unreliable.
+        Asyncio only switches tasks at await points, so this cannot interleave
+        with a purge holding ``self.lock``.
+        """
+        for item in items:
+            self._drop_prewarm_waiter_locked(item)
+
+    def _drop_prewarm_waiter_locked(self, item: PrewarmItem) -> None:
+        waiters = self.prewarm_waiters.get(item.key)
+        if not waiters:
+            return
+        waiters.discard(item)
+        if not waiters:
+            self.prewarm_waiters.pop(item.key, None)
+
+    async def prewarm_one(self, item: PrewarmItem) -> dict:
+        """Bring one path to a complete cached state and report the outcome.
+
+        Adopts an existing fill (whoever started it) or complete entry; only
+        starts an origin fetch when there is none, and then holds the single
+        global prewarm origin slot until that fill is over.
+        """
+        async with self.prewarm_cond:  # condition's lock is self.lock
+            while True:
+                if item.purged:
+                    return self._prewarm_done_locked(item, "purged")
+                e = self.entries.get(item.key)
+                if e is None:
+                    e = self._entry_from_disk(item.key)
+                if e is not None:
+                    if e.state == "complete":
+                        return self._prewarm_done_locked(item, "ready", e)
+                    if e.state == "filling":
+                        break  # adopt this generation; no origin slot needed
+                if not self.prewarm_busy:
+                    # Claim the slot and this generation atomically, so a
+                    # concurrent download cannot start a second fill.
+                    self.prewarm_busy = True
+                    e = Entry(item.key)
+                    e.prewarm_slot = True
+                    self.entries[item.key] = e
+                    e.fill_task = asyncio.create_task(self._fill(e))
+                    self.prewarm_cond.notify_all()  # let same-path items adopt
+                    break
+                # Wait for the slot to free, a purge, or a download-created
+                # fill for this path (attach notifies).
+                await self.prewarm_cond.wait()
+
+        status = await self._await_fill_for_prewarm(e, item)
+        async with self.lock:
+            # Report under the lock: purge marks the item before removing the
+            # entry, so a purged path can never be reported "ready".
+            if item.purged:
+                status = "purged"
+            elif status == "ready" and not (
+                self.entries.get(item.key) is e and e.state == "complete"
+            ):
+                status = "purged" if e.purged else "failed"
+            return self._prewarm_done_locked(item, status, e)
+
+    async def _await_fill_for_prewarm(self, e: Entry, item: PrewarmItem) -> str:
+        async with e.cond:
+            await e.cond.wait_for(
+                lambda: item.purged or e.state != "filling"
+            )
+        if item.purged:
+            return "purged"
+        if e.state == "complete":
+            return "ready"
+        if e.state == "failed":
+            return "failed"
+        return "purged"  # closed: the generation was purged mid-fill
+
+    def _prewarm_done_locked(
+        self, item: PrewarmItem, status: str, e: Entry | None = None
+    ) -> dict:
+        self._drop_prewarm_waiter_locked(item)
+        result = {"path": item.key, "status": status}
+        if status == "ready" and e is not None:
+            result["size"] = e.size
+            sha256 = (e.meta or {}).get("sha256")
+            if sha256:
+                result["sha256"] = sha256
+        elif status == "failed":
+            result["error"] = (e.error if e is not None else None) or "origin fill failed"
+        return result
 
     # ------------------------------------------------------------------ #
     # client streaming                                                    #
@@ -346,6 +523,21 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="pkg-cache-proxy", version="1.0.0", lifespan=lifespan)
 
 
+class PrewarmRequest(BaseModel):
+    paths: list[str] = Field(
+        ...,
+        min_length=1,
+        max_length=16,
+        description="1-16 distinct package paths, e.g. ['pkg-32m.bin']",
+        examples=[["pkg-32m.bin", "pkg-1m.bin"]],
+    )
+    stream: bool = Field(
+        False,
+        description="true: NDJSON, one line per item as soon as it settles; "
+        "false: one JSON object once the whole batch is done",
+    )
+
+
 @app.get("/healthz")
 async def healthz():
     return {"ok": True}
@@ -396,13 +588,62 @@ async def get_package(path: str):
 @app.post("/purge/{path:path}")
 async def purge_package(path: str):
     """Purge one path. The next download re-fills from the origin; downloads
-    already in progress keep reading their old generation to completion."""
+    already in progress keep reading their old generation to completion.
+    Unfinished prewarm items for this path report ``purged``."""
     try:
         key = validate_key(path)
     except ValueError as exc:
         return PlainTextResponse(str(exc), status_code=400)
     was_cached = await cache.purge(key)
     return {"path": key, "purged": True, "was_cached": was_cached}
+
+
+@app.post("/cache/prewarm")
+async def prewarm(req: PrewarmRequest):
+    """Warm the cache for 1-16 distinct paths, one item at a time.
+
+    Each item is settled and reported individually, in request order:
+
+        {"path": "pkg-32m.bin", "status": "ready", "size": 33554432, ...}
+        {"path": "pkg-1m.bin",  "status": "failed", "error": "..."}
+        {"path": "gone.bin",    "status": "purged"}
+
+    With ``"stream": true`` the response is NDJSON and every line is sent the
+    moment that item settles; otherwise the response is one JSON object with
+    an ``items`` array, sent when the whole batch is done.
+
+    ``ready`` is only reported once the whole package is on disk. Items share
+    an existing fill (from a download or another item) instead of starting a
+    second origin fetch, and only one origin fetch started by prewarm may be
+    unfinished at any time. Normal downloads never wait for that slot.
+    """
+    keys: list[str] = []
+    for raw in req.paths:
+        try:
+            keys.append(validate_key(raw))
+        except ValueError as exc:
+            return PlainTextResponse(f"{raw!r}: {exc}", status_code=400)
+    if len(set(keys)) != len(keys):
+        return PlainTextResponse("paths must be distinct", status_code=400)
+
+    items = await cache.register_prewarm(keys)
+
+    async def reports():
+        try:
+            for item in items:
+                yield await cache.prewarm_one(item)
+        finally:
+            cache.unregister_prewarm(items)
+
+    if req.stream:
+        async def ndjson():
+            async for result in reports():
+                yield json.dumps(result, ensure_ascii=False) + "\n"
+
+        return StreamingResponse(ndjson(), media_type="application/x-ndjson")
+
+    results = [result async for result in reports()]
+    return {"items": results, "ready": sum(r["status"] == "ready" for r in results)}
 
 
 @app.get("/cache/status")
